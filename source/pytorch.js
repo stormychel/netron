@@ -47,10 +47,10 @@ pytorch.Graph = class {
         const values = new Map();
         values.map = (name, type, tensor) => {
             if (tensor) {
-                return new pytorch.Value(name, type || null, tensor);
+                return new pytorch.Value(name, type, null, tensor);
             }
             if (!values.has(name)) {
-                values.set(name, new pytorch.Value(name, type || null, tensor || null));
+                values.set(name, new pytorch.Value(name, type, null, tensor));
             } else if (type || tensor) {
                 throw new pytorch.Error(`Duplicate value '${name}'.`);
             }
@@ -265,13 +265,14 @@ pytorch.Argument = class {
 
 pytorch.Value = class {
 
-    constructor(name, type, initializer) {
+    constructor(name, type, quantization, initializer) {
         if (typeof name !== 'string') {
             throw new pytorch.Error(`Invalid value identifier '${JSON.stringify(name)}'.`);
         }
         this.name = name;
-        this.type = initializer ? initializer.type : type;
-        this.initializer = initializer;
+        this.type = initializer && initializer.type ? initializer.type : type || null;
+        this.quantization = quantization;
+        this.initializer = initializer || null;
     }
 };
 
@@ -379,7 +380,7 @@ pytorch.Node = class {
                 const values = list.filter((value) => value !== null).map((value) => {
                     const identifier = value && value.name ? value.name : '';
                     const tensor = value ? new pytorch.Tensor(identifier, value) : null;
-                    return new pytorch.Value(identifier, null, tensor);
+                    return new pytorch.Value(identifier, null, null, tensor);
                 });
                 const argument = new pytorch.Argument(name, values, null, visible);
                 this.inputs.push(argument);
@@ -554,7 +555,7 @@ pytorch.Node = class {
                                         identifier = initializer ? initializer.name : identifier;
                                     }
                                     if (initializer) {
-                                        return new pytorch.Value(identifier, null, initializer);
+                                        return new pytorch.Value(identifier, null, null, initializer);
                                     }
                                     return values.map(identifier);
                                 });
@@ -605,23 +606,23 @@ pytorch.Node = class {
 pytorch.Tensor = class {
 
     constructor(name, tensor) {
-        this._name = name || '';
+        this.name = name || '';
         const layout = tensor.layout ? tensor.layout.__str__() : null;
         const storage = tensor.storage();
         const size = tensor.size() || [];
         if (layout && layout.startsWith('torch.sparse_')) {
-            this._type = new pytorch.TensorType(storage.dtype.__reduce__(), new pytorch.TensorShape(size), layout.split('.').pop().replace('_', '.'));
-            this._indices = new pytorch.Tensor('', tensor.indices);
+            this.type = new pytorch.TensorType(storage.dtype.__reduce__(), new pytorch.TensorShape(size), layout.split('.').pop().replace('_', '.'));
+            this.indices = new pytorch.Tensor('', tensor.indices);
             this._values = new pytorch.Tensor('', tensor.values);
         } else if (!layout || layout === 'torch.strided') {
-            this._type = new pytorch.TensorType(storage.dtype.__reduce__(), new pytorch.TensorShape(size));
+            this.type = new pytorch.TensorType(storage.dtype.__reduce__(), new pytorch.TensorShape(size));
             this._data = storage.data;
-            this._encoding = '<';
-            this._indices = null;
-            this._stride = tensor.stride();
-            const stride = this._stride;
+            this.encoding = '<';
+            this.indices = null;
+            this.stride = tensor.stride();
+            const stride = this.stride;
             const offset = tensor.storage_offset();
-            const length = size.every((v) => v !== 0) ? size.reduce((a, v, i) => a + stride[i] * (v - 1), 1) : 0;
+            const length = stride ? size.every((v) => v !== 0) ? size.reduce((a, v, i) => a + stride[i] * (v - 1), 1) : 0 : storage.size();
             if (offset !== 0 || length !== storage.size()) {
                 const itemsize = storage.dtype.itemsize();
                 this._offset = itemsize * offset;
@@ -632,28 +633,8 @@ pytorch.Tensor = class {
         }
     }
 
-    get name() {
-        return this._name;
-    }
-
-    get type() {
-        return this._type;
-    }
-
-    get encoding() {
-        return this._encoding;
-    }
-
-    get stride() {
-        return this._stride;
-    }
-
-    get indices() {
-        return this._indices;
-    }
-
     get values() {
-        const type = this._type.layout;
+        const type = this.type.layout;
         if (type && type.startsWith('sparse.')) {
             return this._values;
         }
@@ -675,10 +656,10 @@ pytorch.Tensor = class {
     }
 
     decode() {
-        if (this._encoding !== '<') {
-            throw new pytorch.Error(`Tensor encoding '${this._encoding}' not implemented.`);
+        if (this.encoding !== '<') {
+            throw new pytorch.Error(`Tensor encoding '${this.encoding}' not implemented.`);
         }
-        const type = this._type;
+        const type = this.type;
         const data = this.values;
         const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
         switch (type.dataType) {
@@ -4123,7 +4104,48 @@ pytorch.nnapi.Graph = class {
         const values = new Map();
         values.map = (operand) => {
             if (!values.has(operand.index)) {
-                const value = new pytorch.nnapi.Argument(operand);
+                const name = operand.index.toString();
+                const dimensions = operand.dimensions;
+                const shape = new pytorch.TensorShape(dimensions);
+                let dataType = operand.data_type.replace('[]', '');
+                let quantization = null;
+                switch (dataType) {
+                    case 'quant8_asymm':
+                    case 'quant8_symm_per_channel':
+                    case 'quant8_symm':
+                    case 'quant8_asymm_signed[]':
+                    case 'quant16_asymm':
+                    case 'quant16_symm':
+                        quantization = dataType;
+                        dataType = dataType.indexOf('16') !== -1 ? 'uint16' : 'uint8';
+                        break;
+                    default:
+                        break;
+                }
+                const type = new pytorch.TensorType(dataType, shape);
+                let initializer = null;
+                if (operand.data) {
+                    const size = dimensions.reduce((a, b) => a * b, 1);
+                    const tensor = {
+                        size: () => dimensions,
+                        stride: () => null,
+                        storage_offset: () => 0,
+                        storage: () => ({
+                            data: operand.data,
+                            size: () => size,
+                            dtype: { __reduce__: () => type.dataType }
+                        })
+                    };
+                    initializer = new pytorch.Tensor(null, tensor);
+                }
+                if (quantization || (operand.scale !== undefined && operand.scale !== 0) || (operand.zero_point !== undefined && operand.zero_point !== 0)) {
+                    quantization = {
+                        type: quantization || 'linear',
+                        scale: [ operand.scale ],
+                        offset: [ operand.zero_point ]
+                    };
+                }
+                const value = new pytorch.Value(name, type, quantization, initializer);
                 values.set(operand.index, value);
             }
             return values.get(operand.index);
@@ -4144,38 +4166,6 @@ pytorch.nnapi.Graph = class {
             const operand = model.outputs[i];
             const argument = new pytorch.Argument(name, [ values.map(operand) ]);
             this.outputs.push(argument);
-        }
-    }
-};
-
-pytorch.nnapi.Argument = class {
-
-    constructor(operand) {
-        this.name = operand.index.toString();
-        const shape = new pytorch.TensorShape(operand.dimensions);
-        let dataType = operand.data_type.replace('[]', '');
-        let quantization = null;
-        switch (dataType) {
-            case 'quant8_asymm':
-            case 'quant8_symm_per_channel':
-            case 'quant8_symm':
-            case 'quant8_asymm_signed[]':
-            case 'quant16_asymm':
-            case 'quant16_symm':
-                quantization = dataType;
-                dataType = dataType.indexOf('16') !== -1 ? 'uint16' : 'uint8';
-                break;
-            default:
-                break;
-        }
-        this.type = new pytorch.TensorType(dataType, shape);
-        this.initializer = operand.data ? new pytorch.nnapi.Tensor(this.type, operand.data) : null;
-        if (quantization || (operand.scale !== undefined && operand.scale !== 0) || (operand.zero_point !== undefined && operand.zero_point !== 0)) {
-            this.quantization = {
-                type: quantization || 'linear',
-                scale: [ operand.scale ],
-                offset: [ operand.zero_point ]
-            };
         }
     }
 };
@@ -4222,15 +4212,6 @@ pytorch.nnapi.Node = class {
                 this.outputs.push(argument);
             }
         }
-    }
-};
-
-pytorch.nnapi.Tensor = class {
-
-    constructor(type, data) {
-        this.type = type;
-        this.encoding = '<';
-        this.values = data;
     }
 };
 
